@@ -1,0 +1,38 @@
+{
+  "name": "brightdata-live-web-access-workshop",
+  "version": "1.0.0",
+  "description": "Learn how to give AI agents access to real-time web data",
+  "main": "src/main_workflow.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main_workflow.js",
+    "server": "node src/api_server.js",
+    "itinerary": "node src/generate_itinerary.js",
+    "verify": "node src/verify_setup.js",
+    "demo:api": "node src/brightdata_api_demo.js",
+    "demo:mcp": "node src/brightdata_mcp_demo.js"
+  },
+  "keywords": [
+    "brightdata",
+    "web-scraping",
+    "ai",
+    "llm",
+    "serp-api"
+  ],
+  "author": "Bright Data",
+  "license": "MIT",
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.4.8",
+    "@langchain/mcp-adapters": "^0.6.0",
+    "@langchain/openai": "^0.6.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.67.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
