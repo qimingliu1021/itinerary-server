@@ -465,7 +465,7 @@ async function start() {
   try {
     await initializeMCP();
 
-    app.listen(CONFIG.port, () => {
+    app.listen(CONFIG.port, "0.0.0.0", () => {
       console.log("\n" + "=".repeat(60));
       console.log("🚀 Itinerary API Server Running");
       console.log("=".repeat(60));
