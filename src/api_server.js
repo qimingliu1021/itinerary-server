@@ -20,14 +20,14 @@ app.use(cors());
 app.use(express.json());
 
 const CONFIG = {
-  apiKey: process.env.BRIGHTDATA_API_KEY,
+  brightdataApiKey: process.env.BRIGHTDATA_API_KEY,
   openaiKey: process.env.OPENAI_API_KEY,
   openaiModel: process.env.OPENAI_MODEL || "gpt-4o-mini",
   port: process.env.API_PORT || 5500,
 };
 
 // Validate configuration
-if (!CONFIG.apiKey) {
+if (!CONFIG.brightdataApiKey) {
   console.error("❌ BRIGHTDATA_API_KEY is required");
   process.exit(1);
 }
@@ -173,14 +173,17 @@ async function initializeMCP() {
 
   mcpClient = new MultiServerMCPClient({
     bright_data: {
-      url: `https://mcp.brightdata.com/sse?token=${CONFIG.apiKey}&pro=1`,
+      url: `https://mcp.brightdata.com/sse?token=${CONFIG.brightdataApiKey}&pro=1`,
       transport: "sse",
     },
   });
 
   const allTools = await mcpClient.getTools();
+  console.log(`✅ Found ${allTools.length} tools:`);
+  allTools.forEach((t) => console.log(`   - ${t.name}`));
   searchTool = allTools.find((t) => t.name === "search_engine");
   scrapeTool = allTools.find((t) => t.name === "scrape_as_markdown");
+  console.log("Getting tools: ", searchTool, scrapeTool);
 
   if (!searchTool || !scrapeTool) {
     throw new Error("Required tools not found");
@@ -232,10 +235,13 @@ async function generateItinerary(
   // Search for activities (office tours, company visits)
   const activityQuery = `${city} ${interests} attractions activities places to visit things to do ${dateRange}`;
   logger.log(`🔍 Searching activities: ${activityQuery}`);
-  const activityResults = await searchTool.invoke({
-    query: activityQuery,
-    engine: "google",
-  });
+  const activityResults = await searchTool.invoke(
+    {
+      query: activityQuery,
+      engine: "google",
+    },
+    { timeout: 3600000 }
+  );
   const activityData =
     typeof activityResults === "string"
       ? JSON.parse(activityResults)
@@ -246,10 +252,13 @@ async function generateItinerary(
   // Search for events (networking, conferences, meetups)
   const eventQuery = `${city} ${interests} networking events conferences meetups competitions ${dateRange}`;
   logger.log(`🔍 Searching events: ${eventQuery}`);
-  const eventResults = await searchTool.invoke({
-    query: eventQuery,
-    engine: "google",
-  });
+  const eventResults = await searchTool.invoke(
+    {
+      query: eventQuery,
+      engine: "google",
+    },
+    { timeout: 180000 } // 3 minutes
+  );
 
   const eventData =
     typeof eventResults === "string" ? JSON.parse(eventResults) : eventResults;
@@ -285,7 +294,10 @@ async function generateItinerary(
   for (let idx = 0; idx < allUrls.length; idx++) {
     const { url, type } = allUrls[idx];
     try {
-      const content = await scrapeTool.invoke({ url });
+      const content = await scrapeTool.invoke(
+        { url },
+        { timeout: 180000 } // 3 minutes
+      );
 
       scrapedContent.push({
         url,
