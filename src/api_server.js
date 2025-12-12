@@ -11,6 +11,7 @@ import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -433,10 +434,9 @@ Return ONLY valid JSON array with exactly 10-20 items.`;
     logger.logAIPrompt(prompt);
 
     try {
-      const response = await llm.invoke(
-        {
-          role: "system",
-          content: `You are a JSON-only itinerary planner. 
+      const response = await llm.invoke([
+        new SystemMessage(
+          `You are a JSON-only itinerary planner. 
 
 CRITICAL: You MUST return a JSON object in EXACTLY this structure:
 {
@@ -461,10 +461,10 @@ CRITICAL: You MUST return a JSON object in EXACTLY this structure:
 }
 
 DO NOT return just an array like [{}]. You MUST wrap the array in an object with the "itinerary" key.
-Return ONLY valid JSON. No markdown, no code blocks, no explanation.`,
-        },
-        { role: "user", content: prompt }
-      );
+Return ONLY valid JSON. No markdown, no code blocks, no explanation.`
+        ),
+        new HumanMessage(prompt),
+      ]);
 
       logger.logAIResponse(response.content);
 
@@ -511,6 +511,11 @@ app.post("/api/generate-itinerary", async (req, res) => {
       start_date,
       end_date
     );
+
+    // FIX: Check if itinerary exists before accessing properties
+    if (!itinerary) {
+      throw new Error("Failed to generate itinerary (AI processing failed)");
+    }
 
     // Ensure itinerary is an array
     const itineraryArray = Array.isArray(itinerary.itinerary)
