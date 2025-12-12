@@ -197,39 +197,57 @@ async function initializeMCP() {
 /**
  * Safely invokes a tool with auto-reconnect logic
  */
-async function safeToolInvoke(tool, params, options, logger) {
+/**
+ * Safely invokes a tool with auto-reconnect logic
+ * FIX: Added 'attempt' parameter to prevent infinite recursion
+ */
+async function safeToolInvoke(tool, params, options, logger, attempt = 1) {
   try {
     // Try the call normally
-    return await safeToolInvoke(tool, params, options, logger);
+    return await tool.invoke(params, options);
   } catch (error) {
-    // Check if the error is a connection issue
+    // STOP CONDITION: If we have already retried once, stop and throw the error.
+    if (attempt > 1) {
+      logger.log(`❌ Retry attempt failed. Giving up. Error: ${error.message}`);
+      throw error;
+    }
+
+    // Check for connection errors
     const isTransportError =
-      error.message.includes("No active transport") ||
-      error.message.includes("Connection closed") ||
-      error.message.includes("HTTP 400");
+      error.message &&
+      (error.message.includes("No active transport") ||
+        error.message.includes("Connection closed") ||
+        error.message.includes("HTTP 400"));
 
     if (isTransportError) {
       logger.log(
-        `⚠️ Connection lost (${error.message}). Attempting to reconnect...`
+        `⚠️ Connection lost (${error.message}). Re-initializing MCP...`
       );
 
       try {
         // 1. Re-initialize the connection
         await initializeMCP();
 
-        // 2. Update the local tool reference because 'tool' argument is now stale
+        // 2. Get the FRESH tool reference
+        // Note: We use the global variables searchTool/scrapeTool which were just updated by initializeMCP
         const newTool = tool.name === "search_engine" ? searchTool : scrapeTool;
 
-        // 3. Retry the call with the new tool
+        // 3. Retry exactly ONE time (pass attempt = 2)
         logger.log(`🔄 Retrying ${tool.name} with new connection...`);
-        return await newTool.invoke(params, options);
+        return await safeToolInvoke(
+          newTool,
+          params,
+          options,
+          logger,
+          attempt + 1
+        );
       } catch (reconnectError) {
         logger.log(`❌ Reconnection failed: ${reconnectError.message}`);
-        throw reconnectError; // If it fails twice, then we actually fail
+        throw reconnectError;
       }
     }
 
-    // If it's not a connection error, just throw it normally
+    // If it's not a transport error, just throw it
     throw error;
   }
 }
