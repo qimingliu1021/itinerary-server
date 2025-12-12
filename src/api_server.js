@@ -169,27 +169,69 @@ let searchTool = null;
 let scrapeTool = null;
 
 async function initializeMCP() {
-  console.log("🔄 Initializing Bright Data MCP client...");
+  console.log("🔄 Initializing (or re-initializing) Bright Data MCP client...");
 
-  mcpClient = new MultiServerMCPClient({
-    bright_data: {
-      url: `https://mcp.brightdata.com/sse?token=${CONFIG.brightdataApiKey}&pro=1`,
-      transport: "sse",
-    },
-  });
+  try {
+    mcpClient = new MultiServerMCPClient({
+      bright_data: {
+        url: `https://mcp.brightdata.com/sse?token=${CONFIG.brightdataApiKey}&pro=1`,
+        transport: "sse",
+      },
+    });
 
-  const allTools = await mcpClient.getTools();
-  console.log(`✅ Found ${allTools.length} tools:`);
-  allTools.forEach((t) => console.log(`   - ${t.name}`));
-  searchTool = allTools.find((t) => t.name === "search_engine");
-  scrapeTool = allTools.find((t) => t.name === "scrape_as_markdown");
-  console.log("Getting tools: ", searchTool, scrapeTool);
+    const allTools = await mcpClient.getTools();
+    searchTool = allTools.find((t) => t.name === "search_engine");
+    scrapeTool = allTools.find((t) => t.name === "scrape_as_markdown");
 
-  if (!searchTool || !scrapeTool) {
-    throw new Error("Required tools not found");
+    if (!searchTool || !scrapeTool) {
+      throw new Error("Required tools not found");
+    }
+
+    console.log("✅ MCP client initialized");
+  } catch (error) {
+    console.error("❌ Failed to initialize MCP:", error.message);
+    throw error; // Re-throw so the caller knows it failed
   }
+}
 
-  console.log("✅ MCP client initialized");
+/**
+ * Safely invokes a tool with auto-reconnect logic
+ */
+async function safeToolInvoke(tool, params, options, logger) {
+  try {
+    // Try the call normally
+    return await safeToolInvoke(tool, params, options, logger);
+  } catch (error) {
+    // Check if the error is a connection issue
+    const isTransportError =
+      error.message.includes("No active transport") ||
+      error.message.includes("Connection closed") ||
+      error.message.includes("HTTP 400");
+
+    if (isTransportError) {
+      logger.log(
+        `⚠️ Connection lost (${error.message}). Attempting to reconnect...`
+      );
+
+      try {
+        // 1. Re-initialize the connection
+        await initializeMCP();
+
+        // 2. Update the local tool reference because 'tool' argument is now stale
+        const newTool = tool.name === "search_engine" ? searchTool : scrapeTool;
+
+        // 3. Retry the call with the new tool
+        logger.log(`🔄 Retrying ${tool.name} with new connection...`);
+        return await newTool.invoke(params, options);
+      } catch (reconnectError) {
+        logger.log(`❌ Reconnection failed: ${reconnectError.message}`);
+        throw reconnectError; // If it fails twice, then we actually fail
+      }
+    }
+
+    // If it's not a connection error, just throw it normally
+    throw error;
+  }
 }
 
 /**
@@ -235,12 +277,14 @@ async function generateItinerary(
   // Search for activities (office tours, company visits)
   const activityQuery = `${city} ${interests} attractions activities places to visit things to do ${dateRange}`;
   logger.log(`🔍 Searching activities: ${activityQuery}`);
-  const activityResults = await searchTool.invoke(
+  const activityResults = await safeToolInvoke(
+    searchTool,
     {
       query: activityQuery,
       engine: "google",
     },
-    { timeout: 3600000 }
+    { timeout: 3600000 },
+    logger
   );
   const activityData =
     typeof activityResults === "string"
@@ -252,12 +296,14 @@ async function generateItinerary(
   // Search for events (networking, conferences, meetups)
   const eventQuery = `${city} ${interests} networking events conferences meetups competitions ${dateRange}`;
   logger.log(`🔍 Searching events: ${eventQuery}`);
-  const eventResults = await searchTool.invoke(
+  const eventResults = await safeToolInvoke(
+    searchTool,
     {
       query: eventQuery,
       engine: "google",
     },
-    { timeout: 180000 } // 3 minutes
+    { timeout: 180000 },
+    logger
   );
 
   const eventData =
@@ -294,9 +340,11 @@ async function generateItinerary(
   for (let idx = 0; idx < allUrls.length; idx++) {
     const { url, type } = allUrls[idx];
     try {
-      const content = await scrapeTool.invoke(
+      const content = await safeToolInvoke(
+        scrapeTool,
         { url },
-        { timeout: 180000 } // 3 minutes
+        { timeout: 180000 },
+        logger
       );
 
       scrapedContent.push({
@@ -367,7 +415,7 @@ Return ONLY valid JSON array with exactly 10-20 items.`;
     logger.logAIPrompt(prompt);
 
     try {
-      const response = await llm.invoke([
+      const response = await llm.invoke(
         {
           role: "system",
           content: `You are a JSON-only itinerary planner. 
@@ -397,8 +445,8 @@ CRITICAL: You MUST return a JSON object in EXACTLY this structure:
 DO NOT return just an array like [{}]. You MUST wrap the array in an object with the "itinerary" key.
 Return ONLY valid JSON. No markdown, no code blocks, no explanation.`,
         },
-        { role: "user", content: prompt },
-      ]);
+        { role: "user", content: prompt }
+      );
 
       logger.logAIResponse(response.content);
 
