@@ -1,17 +1,21 @@
 /**
- * Itinerary API Server
- * Takes a query and returns structured 3-day itinerary with activities and events
+ * Itinerary API Server - Gemini with Google Search Grounding
+ * Uses Gemini's native search capabilities to find real events and activities
  */
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { ChatOpenAI } from "@langchain/openai";
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+import { GoogleGenAI } from "@google/genai";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import {
+  INTEREST_CATEGORIES,
+  getAllTags,
+  findCategoriesForInterests,
+  getSearchTermsForInterests,
+} from "./user_interests.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,15 +25,14 @@ app.use(cors());
 app.use(express.json());
 
 const CONFIG = {
-  brightdataApiKey: process.env.BRIGHTDATA_API_KEY,
-  openaiKey: process.env.OPENAI_API_KEY,
-  openaiModel: process.env.OPENAI_MODEL || "gpt-4o-mini",
+  googleApiKey: process.env.GOOGLE_API_KEY,
+  geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
   port: process.env.API_PORT || 5500,
 };
 
 // Validate configuration
-if (!CONFIG.brightdataApiKey) {
-  console.error("❌ BRIGHTDATA_API_KEY is required");
+if (!CONFIG.googleApiKey) {
+  console.error("❌ GOOGLE_API_KEY is required");
   process.exit(1);
 }
 
@@ -38,6 +41,9 @@ const logsDir = path.join(__dirname, "../logs");
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
+
+// Initialize Gemini client
+const genAI = new GoogleGenAI({ apiKey: CONFIG.googleApiKey });
 
 // Logger utility
 class Logger {
@@ -57,10 +63,8 @@ class Logger {
       timestamp: new Date().toISOString(),
       city: null,
       interests: null,
-      searches: [],
-      scrapedContent: [],
-      aiPrompt: null,
-      aiResponse: null,
+      prompts: [],
+      responses: [],
       finalItinerary: null,
     };
   }
@@ -71,423 +75,303 @@ class Logger {
     fs.appendFileSync(this.logFile, logEntry);
   }
 
-  logSearch(type, query, results) {
+  logPrompt(step, prompt) {
     this.log(`\n${"=".repeat(80)}`);
-    this.log(`🔍 ${type.toUpperCase()} SEARCH`);
-    this.log(`Query: ${query}`);
-    this.log(`Results count: ${results.organic?.length || 0}`);
-    this.log(`${"=".repeat(80)}\n`);
-
-    this.data.searches.push({
-      type,
-      query,
-      resultsCount: results.organic?.length || 0,
-      results: results,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Save detailed results to file
-    const searchFile = path.join(
-      logsDir,
-      `search_${type}_${this.timestamp}_${this.requestId}.json`
-    );
-    fs.writeFileSync(searchFile, JSON.stringify(results, null, 2));
-    this.log(`📁 Full search results saved to: ${path.basename(searchFile)}`);
-  }
-  logScrape(url, type, content, index, total) {
-    this.log(`\n📄 Scraping [${index}/${total}]: ${url}`);
-    this.log(`Type: ${type}`);
-    this.log(`Content length: ${content.length} characters`);
-
-    this.data.scrapedContent.push({
-      url,
-      type,
-      contentLength: content.length,
-      content: content,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Save individual scraped content
-    const scrapeFile = path.join(
-      logsDir,
-      `scrape_${index}_${this.timestamp}_${this.requestId}.txt`
-    );
-    fs.writeFileSync(
-      scrapeFile,
-      `URL: ${url}\nType: ${type}\nTimestamp: ${new Date().toISOString()}\n\n${content}`
-    );
-  }
-
-  logAIPrompt(prompt) {
-    this.log(`\n${"=".repeat(80)}`);
-    this.log(`🤖 AI PROMPT`);
+    this.log(`🤖 GEMINI PROMPT - Step: ${step}`);
     this.log(`Prompt length: ${prompt.length} characters`);
     this.log(`${"=".repeat(80)}\n`);
 
-    this.data.aiPrompt = prompt;
+    this.data.prompts.push({
+      step,
+      prompt,
+      timestamp: new Date().toISOString(),
+    });
 
     const promptFile = path.join(
       logsDir,
-      `ai_prompt_${this.timestamp}_${this.requestId}.txt`
+      `prompt_${step}_${this.timestamp}_${this.requestId}.txt`
     );
     fs.writeFileSync(promptFile, prompt);
-    this.log(`📁 Full AI prompt saved to: ${path.basename(promptFile)}`);
   }
 
-  logAIResponse(response) {
+  logResponse(step, response) {
     this.log(`\n${"=".repeat(80)}`);
-    this.log(`🤖 AI RESPONSE`);
+    this.log(`🤖 GEMINI RESPONSE - Step: ${step}`);
     this.log(`Response length: ${response.length} characters`);
     this.log(`${"=".repeat(80)}\n`);
 
-    this.data.aiResponse = response;
+    this.data.responses.push({
+      step,
+      response,
+      timestamp: new Date().toISOString(),
+    });
 
     const responseFile = path.join(
       logsDir,
-      `ai_response_${this.timestamp}_${this.requestId}.txt`
+      `response_${step}_${this.timestamp}_${this.requestId}.txt`
     );
     fs.writeFileSync(responseFile, response);
-    this.log(`📁 Full AI response saved to: ${path.basename(responseFile)}`);
   }
+
   logFinalItinerary(itinerary) {
     this.data.finalItinerary = itinerary;
-    this.log(`\n✅ Final itinerary generated with ${itinerary.length} items`);
+    const count = Array.isArray(itinerary)
+      ? itinerary.length
+      : itinerary?.itinerary?.length || 0;
+    this.log(`\n✅ Final itinerary generated with ${count} items`);
   }
 
   saveAll() {
-    // Save comprehensive JSON log
     fs.writeFileSync(this.jsonFile, JSON.stringify(this.data, null, 2));
     this.log(
       `\n📦 Complete log data saved to: ${path.basename(this.jsonFile)}`
     );
-    this.log(`📂 All logs saved in: ${logsDir}`);
-  }
-}
-
-// Initialize MCP client
-let mcpClient = null;
-let searchTool = null;
-let scrapeTool = null;
-
-async function initializeMCP() {
-  console.log("🔄 Initializing (or re-initializing) Bright Data MCP client...");
-
-  try {
-    mcpClient = new MultiServerMCPClient({
-      bright_data: {
-        url: `https://mcp.brightdata.com/sse?token=${CONFIG.brightdataApiKey}&pro=1`,
-        transport: "sse",
-      },
-    });
-
-    const allTools = await mcpClient.getTools();
-    searchTool = allTools.find((t) => t.name === "search_engine");
-    scrapeTool = allTools.find((t) => t.name === "scrape_as_markdown");
-
-    if (!searchTool || !scrapeTool) {
-      throw new Error("Required tools not found");
-    }
-
-    console.log("✅ MCP client initialized");
-  } catch (error) {
-    console.error("❌ Failed to initialize MCP:", error.message);
-    throw error; // Re-throw so the caller knows it failed
   }
 }
 
 /**
- * Safely invokes a tool with auto-reconnect logic
+ * Extract JSON from a response that might contain extra text
  */
-/**
- * Safely invokes a tool with auto-reconnect logic
- * FIX: Added 'attempt' parameter to prevent infinite recursion
- */
-async function safeToolInvoke(tool, params, options, logger, attempt = 1) {
+function extractJSON(text) {
+  console.log("🔧 extractJSON called, text length:", text.length);
+
+  // First, try parsing the text directly
   try {
-    // Try the call normally
-    return await tool.invoke(params, options);
-  } catch (error) {
-    // STOP CONDITION: If we have already retried once, stop and throw the error.
-    if (attempt > 1) {
-      logger.log(`❌ Retry attempt failed. Giving up. Error: ${error.message}`);
-      throw error;
+    return JSON.parse(text);
+  } catch (e) {
+    console.log("🔧 Direct parse failed, trying other methods...");
+  }
+
+  // Try to extract JSON from markdown code block: ```json{...}```
+  const codeBlockMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    console.log("🔧 Found JSON in code block, extracting...");
+    try {
+      return JSON.parse(codeBlockMatch[1].trim());
+    } catch (e) {
+      console.log("🔧 Code block JSON parse failed:", e.message);
     }
+  }
 
-    // Check for connection errors
-    const isTransportError =
-      error.message &&
-      (error.message.includes("No active transport") ||
-        error.message.includes("Connection closed") ||
-        error.message.includes("HTTP 400"));
-
-    if (isTransportError) {
-      logger.log(
-        `⚠️ Connection lost (${error.message}). Re-initializing MCP...`
-      );
-
+  // Try to extract JSON from any code block: ```{...}```
+  const anyCodeBlockMatch = text.match(/```\s*([\s\S]*?)\s*```/);
+  if (anyCodeBlockMatch && anyCodeBlockMatch[1]) {
+    const content = anyCodeBlockMatch[1].trim();
+    if (content.startsWith("{") || content.startsWith("[")) {
+      console.log("🔧 Found JSON in generic code block, extracting...");
       try {
-        // 1. Re-initialize the connection
-        await initializeMCP();
-
-        // 2. Get the FRESH tool reference
-        // Note: We use the global variables searchTool/scrapeTool which were just updated by initializeMCP
-        const newTool = tool.name === "search_engine" ? searchTool : scrapeTool;
-
-        // 3. Retry exactly ONE time (pass attempt = 2)
-        logger.log(`🔄 Retrying ${tool.name} with new connection...`);
-        return await safeToolInvoke(
-          newTool,
-          params,
-          options,
-          logger,
-          attempt + 1
-        );
-      } catch (reconnectError) {
-        logger.log(`❌ Reconnection failed: ${reconnectError.message}`);
-        throw reconnectError;
+        return JSON.parse(content);
+      } catch (e) {
+        console.log("🔧 Generic code block JSON parse failed:", e.message);
       }
     }
-
-    // If it's not a transport error, just throw it
-    throw error;
   }
+
+  // Try to find JSON object in the text using greedy regex
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    console.log("🔧 Found JSON object via regex, length:", jsonMatch[0].length);
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.log("🔧 Regex JSON parse failed:", e.message);
+    }
+  }
+
+  // Try to find JSON array in the text
+  const arrayMatch = text.match(/\[[\s\S]*\]/);
+  if (arrayMatch) {
+    console.log("🔧 Found JSON array via regex");
+    try {
+      const arr = JSON.parse(arrayMatch[0]);
+      return { itinerary: arr };
+    } catch (e) {
+      console.log("🔧 Array JSON parse failed:", e.message);
+    }
+  }
+
+  // Log what we received for debugging
+  console.log("🔧 Raw text first 500 chars:", text.substring(0, 500));
+
+  throw new Error(
+    `Could not extract valid JSON from response. First 200 chars: ${text.substring(
+      0,
+      200
+    )}`
+  );
 }
 
-/**
- * Generate 3-day itinerary with activities and events
- */
-async function generateItinerary(
-  city,
-  interests,
-  maxResults = 20,
-  logger,
-  startDate,
-  endDate
-) {
-  logger.log(`\n📍 Generating itinerary for ${interests} in ${city}`);
-  logger.data.city = city;
-  logger.data.interests = interests;
-
+function buildEventSearchPrompt(city, interests, startDate, endDate) {
   const startDateObj = new Date(startDate);
   const endDateObj = new Date(endDate);
 
-  const llm = CONFIG.openaiKey
-    ? new ChatOpenAI({
-        apiKey: CONFIG.openaiKey,
-        model: CONFIG.openaiModel,
-        temperature: 0.7,
-      })
-    : null;
-
-  // Format dates for search queries
-  const dateRange =
-    startDate && endDate
-      ? `${startDateObj.toLocaleDateString("en-US", {
-          month: "long",
-          day: "numeric",
-          year: "numeric",
-        })} to ${endDateObj.toLocaleDateString("en-US", {
-          month: "long",
-          day: "numeric",
-          year: "numeric",
-        })}`
-      : "upcoming";
-
-  // Search for activities (office tours, company visits)
-  const activityQuery = `${city} ${interests} attractions activities places to visit things to do ${dateRange}`;
-  logger.log(`🔍 Searching activities: ${activityQuery}`);
-  const activityResults = await safeToolInvoke(
-    searchTool,
-    {
-      query: activityQuery,
-      engine: "google",
-    },
-    { timeout: 3600000 },
-    logger
-  );
-  const activityData =
-    typeof activityResults === "string"
-      ? JSON.parse(activityResults)
-      : activityResults;
-
-  logger.logSearch("activity", activityQuery, activityData);
-
-  // Search for events (networking, conferences, meetups)
-  const eventQuery = `${city} ${interests} networking events conferences meetups competitions ${dateRange}`;
-  logger.log(`🔍 Searching events: ${eventQuery}`);
-  const eventResults = await safeToolInvoke(
-    searchTool,
-    {
-      query: eventQuery,
-      engine: "google",
-    },
-    { timeout: 180000 },
-    logger
-  );
-
-  const eventData =
-    typeof eventResults === "string" ? JSON.parse(eventResults) : eventResults;
-
-  logger.logSearch("event", eventQuery, eventData);
-
-  // Scrape top results
-  const allUrls = [];
-
-  // Get 10 activity URLs
-  if (activityData.organic) {
-    for (let i = 0; i < Math.min(3, activityData.organic.length); i++) {
-      if (activityData.organic[i].link) {
-        allUrls.push({ url: activityData.organic[i].link, type: "activity" });
-      }
-    }
-  }
-
-  // Get 10 event URLs
-  if (eventData.organic) {
-    for (let i = 0; i < Math.min(3, eventData.organic.length); i++) {
-      if (eventData.organic[i].link) {
-        allUrls.push({ url: eventData.organic[i].link, type: "event" });
-      }
-    }
-  }
-
-  console.log(`📄 Scraping ${allUrls.length} pages...`);
-  console.log("🔄 All URLs:", allUrls);
-
-  const scrapedContent = [];
-
-  for (let idx = 0; idx < allUrls.length; idx++) {
-    const { url, type } = allUrls[idx];
-    try {
-      const content = await safeToolInvoke(
-        scrapeTool,
-        { url },
-        { timeout: 180000 },
-        logger
-      );
-
-      scrapedContent.push({
-        url,
-        type,
-        content:
-          typeof content === "string" ? content : JSON.stringify(content),
-      });
-      logger.logScrape(url, type, content, idx + 1, allUrls.length);
-    } catch (error) {
-      logger.log(`❌ Failed to scrape ${url}: ${error.message}`, "error");
-    }
-  }
-
-  logger.log(`\n✅ Successfully scraped ${scrapedContent.length} pages`);
-
-  // Use AI to structure the itinerary
-  if (llm && scrapedContent.length > 0) {
-    const prompt = `You are an itinerary planning AI. Based on the scraped web data below, create a structured itinerary for a ${interests} in ${city}.
-
-Requirements:
-- Create activities and events for these SPECIFIC dates:
-  * Start: ${startDateObj.toLocaleDateString("en-US", {
+  // Format dates clearly
+  const formattedStart = startDateObj.toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
     year: "numeric",
-  })}
-  * End: ${endDateObj.toLocaleDateString("en-US", {
+  });
+  const formattedEnd = endDateObj.toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
     year: "numeric",
-  })}
-- 6-10 professional activities (attractions, activities, places to visit, things to do)
-- 5-10 networking/professional events (conferences, meetups, competitions, skill presentations)
-- Each item must have:
-  * name: Activity/event name
-  * type: "activity" or "event"
-  * location: Full address
-  * coordinates: {lat, lng} (estimate if not available)
-  * start_time: ISO 8601 format (MUST be between ${new Date(
-    startDateObj
-  ).toISOString()} and ${endDateObj.toISOString()})
-  * end_time: ISO 8601 format (same date as start_time)
-  * duration_minutes: Number
-  * contact: {name, email, phone} (extract or generate realistic ones)
-  * description: Brief description
-  * url: Source URL
+  });
 
-CRITICAL: All start_time and end_time values MUST be within the date range provided above.
-Distribute items across the date range with realistic timing (9 AM - 9 PM).
-If scraped content doesn't have exact dates, adjust them to fit within the provided date range.
+  const interestList = interests.split(",").map((i) => i.trim());
+  const searchTerms = getSearchTermsForInterests(interestList);
+  const categories = findCategoriesForInterests(interestList);
 
-Scraped Data:
-${scrapedContent
-  .map(
-    (s, i) =>
-      `\n[${i + 1}] ${s.type.toUpperCase()} - ${s.url}\n${s.content.substring(
-        0,
-        2000
-      )}`
-  )
-  .join("\n\n")}
+  const interestContext =
+    searchTerms.length > 0
+      ? `Primary interests: ${interests}\nRelated search terms: ${searchTerms.join(
+          ", "
+        )}\nCategories: ${categories.join(", ")}`
+      : `Interests: ${interests}`;
 
-Return ONLY valid JSON array with exactly 10-20 items.`;
+  return `You are an Expert Event Curator. Search for **LIVE, ORGANIZED, & PARTICIPATORY EVENTS** in ${city} related to: ${interests}.
+  Target Dates: ${formattedStart} to ${formattedEnd}.
+  
+  ${interestContext}
 
-    logger.logAIPrompt(prompt);
+  ## DYNAMIC SEARCH STRATEGY (Construct queries based on the Interest Type):
+  
+  Do not just search for the interest name (e.g., "Finance"). Search for the **ACTIVITY** associated with it. Use these patterns as examples:
 
-    try {
-      const response = await llm.invoke([
-        new SystemMessage(
-          `You are a JSON-only itinerary planner. 
+  1. **For PROFESSIONAL & TECH (Finance, Startups, Career):**
+     - **Keywords:** "Mixer", "Networking", "Fireside Chat", "Panel", "Masterclass", "Breakfast".
+     - **Platforms:** Search "site:lu.ma ${city} ${interests}", "site:eventbrite.com ${city} ${interests} networking".
+     - **Venues:** Search for "Events Calendar" of co-working spaces, chambers of commerce, or industry associations.
 
-CRITICAL: You MUST return a JSON object in EXACTLY this structure:
-{
-  "itinerary": [
-    {
-      "name": "Activity Name",
-      "type": "activity",
-      "location": "Full Address",
-      "coordinates": {"lat": 40.7128, "lng": -74.0060},
-      "start_time": "2025-11-22T09:00:00.000Z",
-      "end_time": "2025-11-22T11:00:00.000Z",
-      "duration_minutes": 120,
-      "contact": {
-        "name": "Contact Name",
-        "email": "email@example.com",
-        "phone": "123-456-7890"
-      },
-      "description": "Brief description",
-      "url": "https://example.com"
+  2. **For ARTS, CULTURE & HISTORY (Museums, Theater, Design):**
+     - **Keywords:** "Gallery Talk", "Curator Tour", "Workshop", "Screening", "Opening Reception", "Performance".
+     - **Strategy:** Search for **"Public Programming"** or **"Calendar"** pages of specific museums/theaters (e.g., "Museum of American Finance events", "The Drawing Center programs").
+
+  3. **For SOCIAL & HOBBIES (Outdoor, Games, Wellness):**
+     - **Keywords:** "Group Run", "Club", "Meetup", "Class", "Session", "Tournament".
+     - **Platforms:** Search "site:meetup.com ${city} ${interests}", "site:partiful.com ${city}", "site:runsignup.com".
+
+  ## STRICT "EVENT" DEFINITION (Must meet ALL criteria):
+  1. **HOSTED/PROGRAMMED:** Must have a human host, instructor, guide, or organizer. (NO "Self-Guided" audio tours).
+  2. **SCHEDULED:** Must have a specific start time (e.g., "Starts at 7:00 PM").
+  3. **NOT "GENERAL ADMISSION":** Do NOT list a museum/park just because it is open. Only list it if there is a specific *Tour*, *Talk*, or *Class* happening.
+  4. **EXCEPTION:** If a venue offers a **Daily Guided Tour** included with admission, that counts as an event.
+
+  ## REQUIREMENTS:
+  1. Provide enough events to cover the day from roughly 9:00 AM to 11:59 PM (can be earlier or later), do not leave more than 1 hour gap during the day. Such as the last event of the day ends at 3pm, which is not allowed. This situation, find more events that covers until midnight.
+  2. Provide at least 3-5 distinct events per day as much as possible.
+  3. The time must match the time zone of ${city}.
+  4. **NO "TIMED ENTRY" SLOTS:** Do not list "Timed Entry", "General Admission", or "Gallery Viewing" as events. These are just open hours.
+  5. **NO "OPEN HOURS":** If the description says "Open 12-6 PM", do NOT create an event called "Afternoon Visit" from 12:00-2:00.
+  6. **STRICT "SPEAKER" RULE:** A valid event MUST have a specific title (like "Book Talk", "Guided Tour", "Workshop") and implies a start time where everyone begins together.
+
+  ## URL HANDLING:
+  1. **EXTRACT, DO NOT INVENT:** You must only use URLs that are explicitly present in the search results (e.g., from Eventbrite, Meetup, Luma, Ticketmaster).
+  2. **NO DEAD LINKS:** If you find a great event but cannot find a direct registration URL in the snippet, return "null" for the url field. Do NOT guess a url like "eventbrite.com/event-name-guess".
+  3. **FALLBACK:** If a specific event URL is missing, provide the URL of the venue or the main organizer's page if available
+  4. **VERBATIM COPY ONLY:** You are FORBIDDEN from constructing, guessing, or predicting URLs. You must only copy-paste URLs exactly as they appear in the search result text.
+  5. **NO PLACEHOLDERS:** If you find yourself typing a URL ID that looks like "123456", "000000", or "1000000000", STOP. This is a fake link. Return null instead.
+  6. **platforms like Eventbrite/Luma rule:** specific IDs for these platforms are usually complex (e.g., "1976223819643"). If you don't see the full complex ID in the snippet, set "url": null.
+
+  OUTPUT JSON FORMAT (Strictly follow this schema):
+  {
+    "itinerary": [
+      {
+        "name": "Event Name (e.g., 'Tech Founders Mixer' or 'Storytelling Workshop')",
+        "type": "event",
+        "category": "meetup", 
+        "location": {
+          "venue": "Venue Name",
+          "address": "Full address",
+          "city": "${city}"
+        },
+        "coordinates": {"lat": 0.0, "lng": 0.0},
+        "start_time": "2026-01-03T18:00:00",
+        "end_time": "2026-01-03T20:00:00",
+        "duration_minutes": 120,
+        "description": "Brief description emphasizing the hosted/group aspect.",
+        "source": {
+          "platform": "Luma/Eventbrite/Venue",
+          "url": "https://actual-event-link.com" 
+        },
+        "pricing": {
+          "is_free": true,
+          "price": "Free",
+          "currency": "USD"
+        },
+        "tags": ["networking", "finance", "workshop"]
+      }
+    ],
+    "search_summary": {
+      "platforms_used": ["Luma", "Eventbrite", "Museum Calendars"],
+      "search_date": "${new Date().toISOString()}"
     }
-  ]
+  }
+
+  CRITICAL: Output ONLY the JSON object. Start with { and end with }`;
 }
 
-DO NOT return just an array like [{}]. You MUST wrap the array in an object with the "itinerary" key.
-Return ONLY valid JSON. No markdown, no code blocks, no explanation.`
-        ),
-        new HumanMessage(prompt),
-      ]);
+/**
+ * Generate itinerary using Gemini with Google Search grounding
+ */
+async function generateItinerary(city, interests, logger, startDate, endDate) {
+  logger.log(`\n📍 Generating itinerary for "${interests}" in ${city}`);
+  logger.log(`📅 Date range: ${startDate} to ${endDate}`);
+  logger.data.city = city;
+  logger.data.interests = interests;
 
-      logger.logAIResponse(response.content);
+  const prompt = buildEventSearchPrompt(city, interests, startDate, endDate);
+  logger.logPrompt("search_and_extract", prompt);
 
-      // Clean markdown formatting if present
-      let jsonText = response.content.trim();
-      jsonText = jsonText.replace(/\n?/g, "").replace(/```\n?/g, "");
+  try {
+    logger.log("🔍 Initiating Gemini search with Google grounding...");
 
-      const itinerary = JSON.parse(jsonText);
+    // Use the @google/genai SDK with Google Search tool
+    // Note: responseMimeType doesn't work with googleSearch tool, so we extract JSON manually
+    const response = await genAI.models.generateContent({
+      model: CONFIG.geminiModel,
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }],
+        temperature: 0.2,
+        topP: 0.8,
+        maxOutputTokens: 8192,
+      },
+    });
 
-      logger.logFinalItinerary(itinerary);
-      console.log("🔄 Itinerary:", itinerary);
+    const responseText = response.text;
+    console.log("📝 Raw response length:", responseText.length);
+    logger.logResponse("search_and_extract", responseText);
 
-      return itinerary;
-    } catch (error) {
-      logger.log(`❌ AI parsing failed: ${error.message}`, "error");
-      return null;
+    // Log grounding metadata if available
+    if (response.candidates?.[0]?.groundingMetadata) {
+      const groundingMeta = response.candidates[0].groundingMetadata;
+      logger.log(
+        `📊 Grounding metadata: ${JSON.stringify(groundingMeta, null, 2)}`
+      );
     }
+
+    // Extract and parse JSON from response
+    const itinerary = extractJSON(responseText);
+    logger.logFinalItinerary(itinerary);
+
+    return itinerary;
+  } catch (error) {
+    logger.log(`❌ Error generating itinerary: ${error.message}`);
+    logger.log(`Stack: ${error.stack}`);
+    throw error;
   }
 }
 
 // API Routes
 app.get("/health", (req, res) => {
-  res.json({ status: "healthy", timestamp: new Date().toISOString() });
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    model: CONFIG.geminiModel,
+    features: ["google_search_grounding"],
+  });
 });
 
 app.post("/api/generate-itinerary", async (req, res) => {
@@ -495,69 +379,109 @@ app.post("/api/generate-itinerary", async (req, res) => {
   const logger = new Logger(requestId);
 
   try {
-    const { city, interests, max_results = 5, start_date, end_date } = req.body;
+    const { city, interests, start_date, end_date } = req.body;
 
+    // Validate required fields
     if (!city || !interests) {
-      return res.status(400).json({ error: "city and interests are required" });
+      return res.status(400).json({
+        error: "city and interests are required",
+        example: {
+          city: "San Francisco",
+          interests: "technology startups",
+          start_date: "2025-02-01",
+          end_date: "2025-02-03",
+        },
+      });
     }
 
+    // Default to next 3 days if dates not provided
+    const today = new Date();
+    const defaultStart = start_date || today.toISOString().split("T")[0];
+    const defaultEnd =
+      end_date ||
+      new Date(today.getTime() + 3 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .split("T")[0];
+
     logger.log(`\n📥 Request ID: ${requestId}`);
-    logger.log(`📥 Request: ${city} / ${interests}`);
+    logger.log(`📥 City: ${city}`);
+    logger.log(`📥 Interests: ${interests}`);
+    logger.log(`📥 Dates: ${defaultStart} to ${defaultEnd}`);
+
     const itinerary = await generateItinerary(
       city,
       interests,
-      max_results,
       logger,
-      start_date,
-      end_date
+      defaultStart,
+      defaultEnd
     );
 
-    // FIX: Check if itinerary exists before accessing properties
     if (!itinerary) {
-      throw new Error("Failed to generate itinerary (AI processing failed)");
+      throw new Error("Failed to generate itinerary");
     }
 
-    // Ensure itinerary is an array
+    // Extract itinerary array
     const itineraryArray = Array.isArray(itinerary.itinerary)
       ? itinerary.itinerary
+      : Array.isArray(itinerary)
+      ? itinerary
       : [];
 
     const response = {
       success: true,
       city,
       interests,
+      date_range: {
+        start: defaultStart,
+        end: defaultEnd,
+      },
       itinerary: itineraryArray,
       total_items: itineraryArray.length,
-      activities: itineraryArray.filter((i) => i.type === "activity").length,
       events: itineraryArray.filter((i) => i.type === "event").length,
+      activities: itineraryArray.filter((i) => i.type === "activity").length,
+      search_summary: itinerary.search_summary || null,
       generated_at: new Date().toISOString(),
       request_id: requestId,
     };
+
     logger.saveAll();
     res.json(response);
   } catch (error) {
     logger.log(`❌ Error: ${error.message}`);
     logger.log(`Stack: ${error.stack}`);
     logger.saveAll();
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: error.message,
+      request_id: requestId,
+    });
   }
 });
 
 // Start server
 async function start() {
   try {
-    await initializeMCP();
+    // Test Gemini connection
+    console.log("🔄 Testing Gemini API connection...");
+    const testResponse = await genAI.models.generateContent({
+      model: CONFIG.geminiModel,
+      contents: "Hello, respond with OK",
+    });
+    console.log("✅ Gemini API connected successfully");
 
     app.listen(CONFIG.port, "0.0.0.0", () => {
       console.log("\n" + "=".repeat(60));
       console.log("🚀 Itinerary API Server Running");
+      console.log("   Powered by Gemini with Google Search Grounding");
       console.log("=".repeat(60));
       console.log(`📡 Server: http://localhost:${CONFIG.port}`);
+      console.log(`🤖 Model: ${CONFIG.geminiModel}`);
       console.log(`🔧 Endpoints:`);
       console.log(`   GET  /health`);
       console.log(`   POST /api/generate-itinerary`);
       console.log("=".repeat(60));
-      console.log("\n✅ Ready to generate itineraries!\n");
+      console.log(
+        "\n✅ Ready to generate itineraries with real-time search!\n"
+      );
     });
   } catch (error) {
     console.error("❌ Failed to start:", error.message);
