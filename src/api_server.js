@@ -1,20 +1,22 @@
 /**
- * Itinerary API Server - Gemini with Google Search Grounding
- * Uses Gemini's native search capabilities to find real events and activities
+ * Itinerary API Server - Orchestrates Scout and Explorer
+ * Uses modular architecture: Scout finds links, Explorer extracts events
  */
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { GoogleGenAI } from "@google/genai";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+
+// Import modules
+import { scoutEvents } from "./scout.js";
+import { exploreLinks } from "./explorer.js";
 import {
   INTEREST_CATEGORIES,
   getAllTags,
   findCategoriesForInterests,
-  getSearchTermsForInterests,
 } from "./user_interests.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,30 +44,33 @@ if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
-// Initialize Gemini client
-const genAI = new GoogleGenAI({ apiKey: CONFIG.googleApiKey });
-
 // Logger utility
 class Logger {
   constructor(requestId) {
     this.requestId = requestId;
     this.timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    this.logFile = path.join(
-      logsDir,
-      `itinerary_${this.timestamp}_${requestId}.log`
-    );
-    this.jsonFile = path.join(
-      logsDir,
-      `itinerary_${this.timestamp}_${requestId}.json`
-    );
+
+    // Create a subfolder for this request
+    this.folderName = `request_${this.timestamp}_${requestId}`;
+    this.requestDir = path.join(logsDir, this.folderName);
+    if (!fs.existsSync(this.requestDir)) {
+      fs.mkdirSync(this.requestDir, { recursive: true });
+    }
+
+    // File paths within the subfolder
+    this.logFile = path.join(this.requestDir, "console.log");
+    this.scoutFile = path.join(this.requestDir, "scout.json");
+    this.explorerFile = path.join(this.requestDir, "explorer.json");
+    this.itineraryFile = path.join(this.requestDir, "itinerary.json");
+
+    // Track platforms used for search_summary
+    this.platformsUsed = new Set();
+
     this.data = {
-      requestId,
-      timestamp: new Date().toISOString(),
       city: null,
       interests: null,
-      prompts: [],
-      responses: [],
-      finalItinerary: null,
+      startDate: null,
+      endDate: null,
     };
   }
 
@@ -75,293 +80,232 @@ class Logger {
     fs.appendFileSync(this.logFile, logEntry);
   }
 
-  logPrompt(step, prompt) {
-    this.log(`\n${"=".repeat(80)}`);
-    this.log(`🤖 GEMINI PROMPT - Step: ${step}`);
-    this.log(`Prompt length: ${prompt.length} characters`);
-    this.log(`${"=".repeat(80)}\n`);
-
-    this.data.prompts.push({
-      step,
-      prompt,
-      timestamp: new Date().toISOString(),
-    });
-
-    const promptFile = path.join(
-      logsDir,
-      `prompt_${step}_${this.timestamp}_${this.requestId}.txt`
+  logScoutResults(results) {
+    this.log(
+      `\n📊 Scout Results: ${results.totalLinksFound} unique links found`
     );
-    fs.writeFileSync(promptFile, prompt);
+
+    // Save full scout results
+    fs.writeFileSync(this.scoutFile, JSON.stringify(results, null, 2));
+    this.log(`📁 Scout results saved to: ${this.folderName}/scout.json`);
   }
 
-  logResponse(step, response) {
-    this.log(`\n${"=".repeat(80)}`);
-    this.log(`🤖 GEMINI RESPONSE - Step: ${step}`);
-    this.log(`Response length: ${response.length} characters`);
-    this.log(`${"=".repeat(80)}\n`);
-
-    this.data.responses.push({
-      step,
-      response,
-      timestamp: new Date().toISOString(),
-    });
-
-    const responseFile = path.join(
-      logsDir,
-      `response_${step}_${this.timestamp}_${this.requestId}.txt`
+  logExplorerResults(results) {
+    this.log(
+      `\n📊 Explorer Results: ${results.totalEvents} valid events extracted`
     );
-    fs.writeFileSync(responseFile, response);
+
+    // Track platforms from events
+    if (results.events) {
+      results.events.forEach((event) => {
+        if (event.source?.platform) {
+          this.platformsUsed.add(event.source.platform);
+        }
+      });
+    }
+
+    // Save full explorer results
+    fs.writeFileSync(this.explorerFile, JSON.stringify(results, null, 2));
+    this.log(`📁 Explorer results saved to: ${this.folderName}/explorer.json`);
   }
 
-  logFinalItinerary(itinerary) {
-    this.data.finalItinerary = itinerary;
-    const count = Array.isArray(itinerary)
-      ? itinerary.length
-      : itinerary?.itinerary?.length || 0;
-    this.log(`\n✅ Final itinerary generated with ${count} items`);
+  logFinalItinerary(events) {
+    this.log(`\n✅ Final itinerary generated with ${events.length} events`);
+
+    // Clean events to match the previous format (remove interest_matched and target_date)
+    const cleanedEvents = events.map((event) => {
+      const { interest_matched, target_date, ...cleanEvent } = event;
+      return cleanEvent;
+    });
+
+    // Build the itinerary output in the previous format
+    const itineraryOutput = {
+      itinerary: cleanedEvents,
+      search_summary: {
+        platforms_used: Array.from(this.platformsUsed),
+        search_date: new Date().toISOString(),
+      },
+    };
+
+    // Save itinerary JSON
+    fs.writeFileSync(
+      this.itineraryFile,
+      JSON.stringify(itineraryOutput, null, 2)
+    );
+    this.log(`📁 Itinerary saved to: ${this.folderName}/itinerary.json`);
   }
 
   saveAll() {
-    fs.writeFileSync(this.jsonFile, JSON.stringify(this.data, null, 2));
-    this.log(
-      `\n📦 Complete log data saved to: ${path.basename(this.jsonFile)}`
-    );
+    this.log(`\n📦 All logs saved to folder: ${this.folderName}`);
   }
 }
 
 /**
- * Extract JSON from a response that might contain extra text
+ * Parse interests string into array
+ * @param {string} interests - Comma-separated interests
+ * @returns {string[]} Array of interests
  */
-function extractJSON(text) {
-  console.log("🔧 extractJSON called, text length:", text.length);
-
-  // First, try parsing the text directly
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    console.log("🔧 Direct parse failed, trying other methods...");
-  }
-
-  // Try to extract JSON from markdown code block: ```json{...}```
-  const codeBlockMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
-  if (codeBlockMatch && codeBlockMatch[1]) {
-    console.log("🔧 Found JSON in code block, extracting...");
-    try {
-      return JSON.parse(codeBlockMatch[1].trim());
-    } catch (e) {
-      console.log("🔧 Code block JSON parse failed:", e.message);
-    }
-  }
-
-  // Try to extract JSON from any code block: ```{...}```
-  const anyCodeBlockMatch = text.match(/```\s*([\s\S]*?)\s*```/);
-  if (anyCodeBlockMatch && anyCodeBlockMatch[1]) {
-    const content = anyCodeBlockMatch[1].trim();
-    if (content.startsWith("{") || content.startsWith("[")) {
-      console.log("🔧 Found JSON in generic code block, extracting...");
-      try {
-        return JSON.parse(content);
-      } catch (e) {
-        console.log("🔧 Generic code block JSON parse failed:", e.message);
-      }
-    }
-  }
-
-  // Try to find JSON object in the text using greedy regex
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    console.log("🔧 Found JSON object via regex, length:", jsonMatch[0].length);
-    try {
-      return JSON.parse(jsonMatch[0]);
-    } catch (e) {
-      console.log("🔧 Regex JSON parse failed:", e.message);
-    }
-  }
-
-  // Try to find JSON array in the text
-  const arrayMatch = text.match(/\[[\s\S]*\]/);
-  if (arrayMatch) {
-    console.log("🔧 Found JSON array via regex");
-    try {
-      const arr = JSON.parse(arrayMatch[0]);
-      return { itinerary: arr };
-    } catch (e) {
-      console.log("🔧 Array JSON parse failed:", e.message);
-    }
-  }
-
-  // Log what we received for debugging
-  console.log("🔧 Raw text first 500 chars:", text.substring(0, 500));
-
-  throw new Error(
-    `Could not extract valid JSON from response. First 200 chars: ${text.substring(
-      0,
-      200
-    )}`
-  );
-}
-
-function buildEventSearchPrompt(city, interests, startDate, endDate) {
-  const startDateObj = new Date(startDate);
-  const endDateObj = new Date(endDate);
-
-  // Format dates clearly
-  const formattedStart = startDateObj.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-  const formattedEnd = endDateObj.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-
-  const interestList = interests.split(",").map((i) => i.trim());
-  const searchTerms = getSearchTermsForInterests(interestList);
-  const categories = findCategoriesForInterests(interestList);
-
-  const interestContext =
-    searchTerms.length > 0
-      ? `Primary interests: ${interests}\nRelated search terms: ${searchTerms.join(
-          ", "
-        )}\nCategories: ${categories.join(", ")}`
-      : `Interests: ${interests}`;
-
-  return `You are an Expert Event Curator. Search for **LIVE, ORGANIZED, & PARTICIPATORY EVENTS** in ${city} related to: ${interests}.
-  Target Dates: ${formattedStart} to ${formattedEnd}.
-  
-  ${interestContext}
-
-  ## DYNAMIC SEARCH STRATEGY (Construct queries based on the Interest Type):
-  
-  Do not just search for the interest name (e.g., "Finance"). Search for the **ACTIVITY** associated with it. Use these patterns as examples:
-
-  1. **For PROFESSIONAL & TECH (Finance, Startups, Career):**
-     - **Keywords:** "Mixer", "Networking", "Fireside Chat", "Panel", "Masterclass", "Breakfast".
-     - **Platforms:** Search "site:lu.ma ${city} ${interests}", "site:eventbrite.com ${city} ${interests} networking".
-     - **Venues:** Search for "Events Calendar" of co-working spaces, chambers of commerce, or industry associations.
-
-  2. **For ARTS, CULTURE & HISTORY (Museums, Theater, Design):**
-     - **Keywords:** "Gallery Talk", "Curator Tour", "Workshop", "Screening", "Opening Reception", "Performance".
-     - **Strategy:** Search for **"Public Programming"** or **"Calendar"** pages of specific museums/theaters (e.g., "Museum of American Finance events", "The Drawing Center programs").
-
-  3. **For SOCIAL & HOBBIES (Outdoor, Games, Wellness):**
-     - **Keywords:** "Group Run", "Club", "Meetup", "Class", "Session", "Tournament".
-     - **Platforms:** Search "site:meetup.com ${city} ${interests}", "site:partiful.com ${city}", "site:runsignup.com".
-
-  ## STRICT "EVENT" DEFINITION (Must meet ALL criteria):
-  1. **HOSTED/PROGRAMMED:** Must have a human host, instructor, guide, or organizer. (NO "Self-Guided" audio tours).
-  2. **SCHEDULED:** Must have a specific start time (e.g., "Starts at 7:00 PM").
-  3. **NOT "GENERAL ADMISSION":** Do NOT list a museum/park just because it is open. Only list it if there is a specific *Tour*, *Talk*, or *Class* happening.
-  4. **EXCEPTION:** If a venue offers a **Daily Guided Tour** included with admission, that counts as an event.
-
-  ## REQUIREMENTS:
-  1. Provide enough events to cover the day from roughly 9:00 AM to 11:59 PM (can be earlier or later), do not leave more than 1 hour gap during the day. Such as the last event of the day ends at 3pm, which is not allowed. This situation, find more events that covers until midnight.
-  2. Provide at least 3-5 distinct events per day as much as possible.
-  3. The time must match the time zone of ${city}.
-  4. **NO "TIMED ENTRY" SLOTS:** Do not list "Timed Entry", "General Admission", or "Gallery Viewing" as events. These are just open hours.
-  5. **NO "OPEN HOURS":** If the description says "Open 12-6 PM", do NOT create an event called "Afternoon Visit" from 12:00-2:00.
-  6. **STRICT "SPEAKER" RULE:** A valid event MUST have a specific title (like "Book Talk", "Guided Tour", "Workshop") and implies a start time where everyone begins together.
-
-  ## URL HANDLING:
-  1. **EXTRACT, DO NOT INVENT:** You must only use URLs that are explicitly present in the search results (e.g., from Eventbrite, Meetup, Luma, Ticketmaster).
-  2. **NO DEAD LINKS:** If you find a great event but cannot find a direct registration URL in the snippet, return "null" for the url field. Do NOT guess a url like "eventbrite.com/event-name-guess".
-  3. **FALLBACK:** If a specific event URL is missing, provide the URL of the venue or the main organizer's page if available
-  4. **VERBATIM COPY ONLY:** You are FORBIDDEN from constructing, guessing, or predicting URLs. You must only copy-paste URLs exactly as they appear in the search result text.
-  5. **NO PLACEHOLDERS:** If you find yourself typing a URL ID that looks like "123456", "000000", or "1000000000", STOP. This is a fake link. Return null instead.
-  6. **platforms like Eventbrite/Luma rule:** specific IDs for these platforms are usually complex (e.g., "1976223819643"). If you don't see the full complex ID in the snippet, set "url": null.
-
-  OUTPUT JSON FORMAT (Strictly follow this schema):
-  {
-    "itinerary": [
-      {
-        "name": "Event Name (e.g., 'Tech Founders Mixer' or 'Storytelling Workshop')",
-        "type": "event",
-        "category": "meetup", 
-        "location": {
-          "venue": "Venue Name",
-          "address": "Full address",
-          "city": "${city}"
-        },
-        "coordinates": {"lat": 0.0, "lng": 0.0},
-        "start_time": "2026-01-03T18:00:00",
-        "end_time": "2026-01-03T20:00:00",
-        "duration_minutes": 120,
-        "description": "Brief description emphasizing the hosted/group aspect.",
-        "source": {
-          "platform": "Luma/Eventbrite/Venue",
-          "url": "https://actual-event-link.com" 
-        },
-        "pricing": {
-          "is_free": true,
-          "price": "Free",
-          "currency": "USD"
-        },
-        "tags": ["networking", "finance", "workshop"]
-      }
-    ],
-    "search_summary": {
-      "platforms_used": ["Luma", "Eventbrite", "Museum Calendars"],
-      "search_date": "${new Date().toISOString()}"
-    }
-  }
-
-  CRITICAL: Output ONLY the JSON object. Start with { and end with }`;
+function parseInterests(interests) {
+  return interests
+    .split(",")
+    .map((i) => i.trim())
+    .filter((i) => i.length > 0);
 }
 
 /**
- * Generate itinerary using Gemini with Google Search grounding
+ * Ensure minimum events per day coverage
+ * @param {Object[]} events - Array of events
+ * @param {string} startDate - Start date
+ * @param {string} endDate - End date
+ * @returns {Object} Events grouped by day with coverage info
  */
-async function generateItinerary(city, interests, logger, startDate, endDate) {
-  logger.log(`\n📍 Generating itinerary for "${interests}" in ${city}`);
-  logger.log(`📅 Date range: ${startDate} to ${endDate}`);
+function analyzeEventCoverage(events, startDate, endDate) {
+  const grouped = {};
+  const current = new Date(startDate);
+  const end = new Date(endDate);
+
+  // Initialize all dates
+  while (current <= end) {
+    const dateStr = current.toISOString().split("T")[0];
+    grouped[dateStr] = [];
+    current.setDate(current.getDate() + 1);
+  }
+
+  // Group events by date
+  events.forEach((event) => {
+    if (event.start_time) {
+      const eventDate = event.start_time.split("T")[0];
+      if (grouped[eventDate]) {
+        grouped[eventDate].push(event);
+      }
+    }
+  });
+
+  // Calculate coverage
+  const coverage = {};
+  Object.entries(grouped).forEach(([date, dayEvents]) => {
+    coverage[date] = {
+      count: dayEvents.length,
+      events: dayEvents,
+      hasMorning: dayEvents.some((e) => {
+        const hour = parseInt(e.start_time.split("T")[1].split(":")[0]);
+        return hour >= 8 && hour < 12;
+      }),
+      hasAfternoon: dayEvents.some((e) => {
+        const hour = parseInt(e.start_time.split("T")[1].split(":")[0]);
+        return hour >= 12 && hour < 17;
+      }),
+      hasEvening: dayEvents.some((e) => {
+        const hour = parseInt(e.start_time.split("T")[1].split(":")[0]);
+        return hour >= 17;
+      }),
+    };
+  });
+
+  return coverage;
+}
+
+/**
+ * Main orchestration function - coordinates Scout and Explorer
+ * @param {string} city - The city
+ * @param {string[]} interests - Array of interests
+ * @param {string} startDate - Start date
+ * @param {string} endDate - End date
+ * @param {Logger} logger - Logger instance
+ * @returns {Promise<Object>} Final itinerary
+ */
+async function generateItinerary(city, interests, startDate, endDate, logger) {
+  logger.log(`\n${"=".repeat(60)}`);
+  logger.log(`🚀 Starting Itinerary Generation Pipeline`);
+  logger.log(`${"=".repeat(60)}`);
+  logger.log(`📍 City: ${city}`);
+  logger.log(`🎯 Interests: ${interests.join(", ")}`);
+  logger.log(`📅 Dates: ${startDate} to ${endDate}`);
+
   logger.data.city = city;
   logger.data.interests = interests;
+  logger.data.startDate = startDate;
+  logger.data.endDate = endDate;
 
-  const prompt = buildEventSearchPrompt(city, interests, startDate, endDate);
-  logger.logPrompt("search_and_extract", prompt);
+  // Phase 1: Scout - Find event links
+  logger.log(`\n${"─".repeat(40)}`);
+  logger.log(`📡 PHASE 1: SCOUT - Finding Event Links`);
+  logger.log(`${"─".repeat(40)}`);
 
-  try {
-    logger.log("🔍 Initiating Gemini search with Google grounding...");
+  const scoutResults = await scoutEvents(
+    city,
+    interests,
+    startDate,
+    endDate,
+    (msg) => logger.log(msg)
+  );
 
-    // Use the @google/genai SDK with Google Search tool
-    // Note: responseMimeType doesn't work with googleSearch tool, so we extract JSON manually
-    const response = await genAI.models.generateContent({
-      model: CONFIG.geminiModel,
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        temperature: 0.2,
-        topP: 0.8,
-        maxOutputTokens: 8192,
-      },
-    });
+  logger.logScoutResults(scoutResults);
 
-    const responseText = response.text;
-    console.log("📝 Raw response length:", responseText.length);
-    logger.logResponse("search_and_extract", responseText);
-
-    // Log grounding metadata if available
-    if (response.candidates?.[0]?.groundingMetadata) {
-      const groundingMeta = response.candidates[0].groundingMetadata;
-      logger.log(
-        `📊 Grounding metadata: ${JSON.stringify(groundingMeta, null, 2)}`
-      );
-    }
-
-    // Extract and parse JSON from response
-    const itinerary = extractJSON(responseText);
-    logger.logFinalItinerary(itinerary);
-
-    return itinerary;
-  } catch (error) {
-    logger.log(`❌ Error generating itinerary: ${error.message}`);
-    logger.log(`Stack: ${error.stack}`);
-    throw error;
+  if (scoutResults.allLinks.length === 0) {
+    logger.log(`⚠️ Scout found no links. Cannot proceed.`);
+    return {
+      success: false,
+      events: [],
+      message: "No event links found during search",
+    };
   }
+
+  // Phase 2: Explorer - Analyze links and extract events
+  logger.log(`\n${"─".repeat(40)}`);
+  logger.log(`🔬 PHASE 2: EXPLORER - Analyzing Links`);
+  logger.log(`${"─".repeat(40)}`);
+
+  const explorerResults = await exploreLinks(
+    scoutResults.allLinks,
+    city,
+    (msg) => logger.log(msg)
+  );
+
+  logger.logExplorerResults(explorerResults);
+
+  // Phase 3: Organize and validate events
+  logger.log(`\n${"─".repeat(40)}`);
+  logger.log(`📋 PHASE 3: ORGANIZING EVENTS`);
+  logger.log(`${"─".repeat(40)}`);
+
+  const events = explorerResults.events || [];
+
+  // Sort by start_time
+  events.sort((a, b) => {
+    const timeA = new Date(a.start_time).getTime();
+    const timeB = new Date(b.start_time).getTime();
+    return timeA - timeB;
+  });
+
+  // Analyze coverage
+  const coverage = analyzeEventCoverage(events, startDate, endDate);
+
+  // Log coverage summary
+  Object.entries(coverage).forEach(([date, info]) => {
+    logger.log(
+      `📅 ${date}: ${info.count} events (M:${info.hasMorning ? "✓" : "✗"} A:${
+        info.hasAfternoon ? "✓" : "✗"
+      } E:${info.hasEvening ? "✓" : "✗"})`
+    );
+  });
+
+  logger.logFinalItinerary(events);
+
+  return {
+    success: true,
+    events,
+    coverage,
+    scoutStats: {
+      totalLinksFound: scoutResults.totalLinksFound,
+      searchesPerformed: scoutResults.searchResults?.length || 0,
+    },
+    explorerStats: {
+      linksAnalyzed: explorerResults.totalAnalyzed,
+      eventsExtracted: explorerResults.totalEvents,
+      linksRejected: explorerResults.rejected?.length || 0,
+    },
+  };
 }
 
 // API Routes
@@ -370,10 +314,20 @@ app.get("/health", (req, res) => {
     status: "healthy",
     timestamp: new Date().toISOString(),
     model: CONFIG.geminiModel,
-    features: ["google_search_grounding"],
+    architecture: "Scout + Explorer Pipeline",
   });
 });
 
+// Get available interest categories
+app.get("/api/interests", (req, res) => {
+  res.json({
+    success: true,
+    categories: INTEREST_CATEGORIES,
+    all_tags: getAllTags(),
+  });
+});
+
+// Main itinerary generation endpoint
 app.post("/api/generate-itinerary", async (req, res) => {
   const requestId = Date.now().toString();
   const logger = new Logger(requestId);
@@ -386,60 +340,58 @@ app.post("/api/generate-itinerary", async (req, res) => {
       return res.status(400).json({
         error: "city and interests are required",
         example: {
-          city: "San Francisco",
-          interests: "technology startups",
-          start_date: "2025-02-01",
-          end_date: "2025-02-03",
+          city: "New York, NY",
+          interests: "Technology, Networking, Art",
+          start_date: "2026-01-15",
+          end_date: "2026-01-17",
         },
       });
     }
 
-    // Default to next 3 days if dates not provided
-    const today = new Date();
-    const defaultStart = start_date || today.toISOString().split("T")[0];
-    const defaultEnd =
-      end_date ||
-      new Date(today.getTime() + 3 * 24 * 60 * 60 * 1000)
-        .toISOString()
-        .split("T")[0];
+    // Parse interests
+    const interestArray = parseInterests(interests);
+    if (interestArray.length === 0) {
+      return res.status(400).json({
+        error: "At least one interest is required",
+      });
+    }
 
     logger.log(`\n📥 Request ID: ${requestId}`);
     logger.log(`📥 City: ${city}`);
-    logger.log(`📥 Interests: ${interests}`);
-    logger.log(`📥 Dates: ${defaultStart} to ${defaultEnd}`);
+    logger.log(`📥 Interests: ${interestArray.join(", ")}`);
+    logger.log(`📥 Dates: ${start_date} to ${end_date}`);
 
-    const itinerary = await generateItinerary(
+    // Generate itinerary
+    const result = await generateItinerary(
       city,
-      interests,
-      logger,
-      defaultStart,
-      defaultEnd
+      interestArray,
+      start_date,
+      end_date,
+      logger
     );
 
-    if (!itinerary) {
-      throw new Error("Failed to generate itinerary");
+    if (!result.success) {
+      throw new Error(result.message || "Failed to generate itinerary");
     }
 
-    // Extract itinerary array
-    const itineraryArray = Array.isArray(itinerary.itinerary)
-      ? itinerary.itinerary
-      : Array.isArray(itinerary)
-      ? itinerary
-      : [];
-
+    // Build response
     const response = {
       success: true,
       city,
-      interests,
+      interests: interestArray,
       date_range: {
-        start: defaultStart,
-        end: defaultEnd,
+        start: start_date,
+        end: end_date,
       },
-      itinerary: itineraryArray,
-      total_items: itineraryArray.length,
-      events: itineraryArray.filter((i) => i.type === "event").length,
-      activities: itineraryArray.filter((i) => i.type === "activity").length,
-      search_summary: itinerary.search_summary || null,
+      itinerary: result.events,
+      itinerary_by_day: result.coverage,
+      total_items: result.events.length,
+      events: result.events.filter((e) => e.type === "event").length,
+      activities: result.events.filter((e) => e.type === "activity").length,
+      pipeline_stats: {
+        scout: result.scoutStats,
+        explorer: result.explorerStats,
+      },
       generated_at: new Date().toISOString(),
       request_id: requestId,
     };
@@ -460,28 +412,32 @@ app.post("/api/generate-itinerary", async (req, res) => {
 // Start server
 async function start() {
   try {
-    // Test Gemini connection
-    console.log("🔄 Testing Gemini API connection...");
-    const testResponse = await genAI.models.generateContent({
-      model: CONFIG.geminiModel,
-      contents: "Hello, respond with OK",
-    });
-    console.log("✅ Gemini API connected successfully");
+    console.log("🔄 Validating configuration...");
+
+    if (!CONFIG.googleApiKey) {
+      throw new Error("GOOGLE_API_KEY is not set");
+    }
+
+    console.log("✅ Configuration valid");
 
     app.listen(CONFIG.port, "0.0.0.0", () => {
       console.log("\n" + "=".repeat(60));
       console.log("🚀 Itinerary API Server Running");
-      console.log("   Powered by Gemini with Google Search Grounding");
+      console.log("   Architecture: Scout + Explorer Pipeline");
       console.log("=".repeat(60));
       console.log(`📡 Server: http://localhost:${CONFIG.port}`);
       console.log(`🤖 Model: ${CONFIG.geminiModel}`);
       console.log(`🔧 Endpoints:`);
       console.log(`   GET  /health`);
+      console.log(`   GET  /api/interests`);
       console.log(`   POST /api/generate-itinerary`);
       console.log("=".repeat(60));
-      console.log(
-        "\n✅ Ready to generate itineraries with real-time search!\n"
-      );
+      console.log(`\n📋 Pipeline Flow:`);
+      console.log(`   1. Scout  → Search for event links per interest/day`);
+      console.log(`   2. Explorer → Analyze links, extract event details`);
+      console.log(`   3. Organize → Sort and group events by day`);
+      console.log("=".repeat(60));
+      console.log("\n✅ Ready to generate itineraries!\n");
     });
   } catch (error) {
     console.error("❌ Failed to start:", error.message);
