@@ -9,6 +9,7 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { GoogleGenAI } from "@google/genai";
 
 // Import modules
 import { scoutEvents } from "./scout.js";
@@ -31,6 +32,9 @@ const CONFIG = {
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
   port: process.env.API_PORT || 5500,
 };
+
+// Initialize Gemini AI client for edit operations
+const genAI = new GoogleGenAI({ apiKey: CONFIG.googleApiKey });
 
 // Validate configuration
 if (!CONFIG.googleApiKey) {
@@ -409,6 +413,196 @@ app.post("/api/generate-itinerary", async (req, res) => {
   }
 });
 
+// ============= EDIT ITINERARY ENDPOINT =============
+
+/**
+ * Edit a single activity using AI
+ * @param {Object} params - Edit parameters
+ * @returns {Promise<Object>} Edit result
+ */
+async function processEditRequest(params) {
+  const { edit_request, current_activity, city, day_date, interests } = params;
+
+  const systemPrompt = `You are an itinerary editing assistant. Your job is to help users modify their travel plans.
+
+You MUST respond with ONLY valid JSON (no markdown, no backticks, no explanation).
+
+Based on the user's request, determine the appropriate operation and provide the result.
+
+Operations:
+1. "replace" - Replace the current activity with a new one (user wants something different)
+2. "delete" - Remove the activity (user doesn't want it)
+3. "update_time" - Only change the timing
+4. "update_description" - Only change the description
+5. "add" - Add a new activity (user wants to add something nearby/after)
+
+For "replace" or "add" operations, you must provide realistic details:
+- Real place names that exist in ${city}
+- Realistic coordinates (latitude/longitude for ${city})
+- Appropriate timing based on the activity type
+- Detailed description
+
+Response format:
+{
+  "operation": "replace|delete|update_time|update_description|add",
+  "updated_activity": {
+    "name": "Place Name",
+    "location": "Full address",
+    "coordinates": { "lat": number, "lng": number },
+    "start_time": "ISO datetime",
+    "end_time": "ISO datetime",
+    "description": "Description of the place",
+    "type": "activity|restaurant|attraction",
+    "tags": ["tag1", "tag2"]
+  },
+  "new_activity": { ... },  // Only for "add" operation
+  "change_summary": "Brief description of what changed"
+}
+
+For "delete" operation, only include:
+{
+  "operation": "delete",
+  "change_summary": "Removed X from itinerary"
+}
+
+For "update_time" operation:
+{
+  "operation": "update_time",
+  "updated_activity": {
+    "start_time": "new ISO datetime",
+    "end_time": "new ISO datetime"
+  },
+  "change_summary": "Changed time to X"
+}`;
+
+  const userPrompt = `City: ${city}
+Date: ${day_date}
+User interests: ${interests?.join(", ") || "general"}
+
+Current activity:
+${JSON.stringify(current_activity, null, 2)}
+
+User's edit request: "${edit_request}"
+
+Provide the appropriate edit response as JSON.`;
+
+  try {
+    const response = await genAI.models.generateContent({
+      model: CONFIG.geminiModel,
+      contents: systemPrompt + "\n\n" + userPrompt,
+      config: {
+        temperature: 0.3,
+        maxOutputTokens: 1024,
+      },
+    });
+
+    // Get text from response
+    let text = response.text;
+    if (!text && response.candidates?.[0]?.content?.parts?.[0]?.text) {
+      text = response.candidates[0].content.parts[0].text;
+    }
+
+    // Parse JSON from response
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Try to extract from markdown code block
+      const codeBlockMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+      if (codeBlockMatch && codeBlockMatch[1]) {
+        try {
+          parsed = JSON.parse(codeBlockMatch[1].trim());
+        } catch (e) {
+          // Continue to next method
+        }
+      }
+      
+      // Try to extract JSON if model added extra text
+      if (!parsed) {
+        const start = text.indexOf("{");
+        const end = text.lastIndexOf("}");
+        if (start >= 0 && end > start) {
+          try {
+            parsed = JSON.parse(text.slice(start, end + 1));
+          } catch (e) {
+            console.error("JSON parse error:", e.message);
+            throw new Error("Model did not return valid JSON: " + text.substring(0, 200));
+          }
+        } else {
+          throw new Error("No JSON found in response: " + text.substring(0, 200));
+        }
+      }
+    }
+
+    return parsed;
+  } catch (error) {
+    console.error("AI processing error:", error);
+    throw error;
+  }
+}
+
+// Edit itinerary endpoint
+app.post("/api/edit-itinerary", async (req, res) => {
+  const requestId = Date.now().toString();
+
+  try {
+    const { edit_request, current_activity, city, day_date, interests } =
+      req.body;
+
+    // Validate required fields
+    if (!edit_request || !current_activity) {
+      return res.status(400).json({
+        error: "edit_request and current_activity are required",
+        example: {
+          edit_request: "Change this to a coffee shop nearby",
+          current_activity: {
+            name: "Museum of Modern Art",
+            location: "123 Main St",
+            coordinates: { lat: 37.78, lng: -122.41 },
+            start_time: "2026-01-15T10:00:00",
+            end_time: "2026-01-15T12:00:00",
+            description: "Art museum",
+          },
+          city: "San Francisco",
+          day_date: "2026-01-15",
+          interests: ["art", "food"],
+        },
+      });
+    }
+
+    console.log(`\n📝 Edit Request [${requestId}]`);
+    console.log(`   City: ${city}`);
+    console.log(`   Edit: "${edit_request}"`);
+    console.log(`   Activity: ${current_activity.name}`);
+
+    // Process edit with AI
+    const editResult = await processEditRequest({
+      edit_request,
+      current_activity,
+      city: city || "Unknown City",
+      day_date: day_date || new Date().toISOString().split("T")[0],
+      interests: interests || [],
+    });
+
+    console.log(`✅ Edit processed: ${editResult.operation}`);
+    console.log(`   Summary: ${editResult.change_summary}`);
+
+    res.json({
+      success: true,
+      ...editResult,
+      request_id: requestId,
+      processed_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error(`❌ Edit Error [${requestId}]:`, error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      request_id: requestId,
+    });
+  }
+});
+
 // Start server
 async function start() {
   try {
@@ -431,6 +625,7 @@ async function start() {
       console.log(`   GET  /health`);
       console.log(`   GET  /api/interests`);
       console.log(`   POST /api/generate-itinerary`);
+      console.log(`   POST /api/edit-itinerary`);
       console.log("=".repeat(60));
       console.log(`\n📋 Pipeline Flow:`);
       console.log(`   1. Scout  → Search for event links per interest/day`);
