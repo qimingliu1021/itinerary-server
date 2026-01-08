@@ -492,7 +492,7 @@ Provide the appropriate edit response as JSON.`;
       contents: systemPrompt + "\n\n" + userPrompt,
       config: {
         temperature: 0.3,
-        maxOutputTokens: 1024,
+        maxOutputTokens: 2048,
       },
     });
 
@@ -500,6 +500,11 @@ Provide the appropriate edit response as JSON.`;
     let text = response.text;
     if (!text && response.candidates?.[0]?.content?.parts?.[0]?.text) {
       text = response.candidates[0].content.parts[0].text;
+    }
+    
+    if (!text) {
+      console.error("Empty response from model:", response.candidates?.[0]);
+      throw new Error("AI model returned empty response. Please try again.");
     }
 
     // Parse JSON from response
