@@ -9,11 +9,11 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { GoogleGenAI } from "@google/genai";
 
 // Import modules
 import { scoutEvents } from "./scout.js";
 import { exploreLinks } from "./explorer.js";
+import { processEditRequest } from "./edit_itinerary.js";
 import {
   INTEREST_CATEGORIES,
   getAllTags,
@@ -32,9 +32,6 @@ const CONFIG = {
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
   port: process.env.API_PORT || 5500,
 };
-
-// Initialize Gemini AI client for edit operations
-const genAI = new GoogleGenAI({ apiKey: CONFIG.googleApiKey });
 
 // Validate configuration
 if (!CONFIG.googleApiKey) {
@@ -329,6 +326,202 @@ app.get("/api/interests", (req, res) => {
     categories: INTEREST_CATEGORIES,
     all_tags: getAllTags(),
   });
+});
+
+// Streaming itinerary generation endpoint (SSE)
+app.post("/api/generate-itinerary-stream", async (req, res) => {
+  const requestId = Date.now().toString();
+  const logger = new Logger(requestId);
+
+  // Set up SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  // Helper to send SSE events
+  const sendEvent = (type, data) => {
+    res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+  };
+
+  // Send initial connection confirmation
+  sendEvent("connected", { message: "Stream connected", requestId });
+
+  try {
+    const { city, interests, start_date, end_date } = req.body;
+
+    // Validate required fields
+    if (!city || !interests) {
+      sendEvent("error", { message: "city and interests are required" });
+      res.end();
+      return;
+    }
+
+    const interestArray = parseInterests(interests);
+    if (interestArray.length === 0) {
+      sendEvent("error", { message: "At least one interest is required" });
+      res.end();
+      return;
+    }
+
+    sendEvent("progress", {
+      phase: "start",
+      message: `Planning your ${city} adventure...`,
+      detail: `Looking for ${interestArray.join(", ")} experiences`,
+    });
+
+    // Store request info
+    logger.data.city = city;
+    logger.data.interests = interestArray;
+    logger.data.startDate = start_date;
+    logger.data.endDate = end_date;
+
+    // Phase 1: Scout
+    sendEvent("progress", {
+      phase: "scout",
+      message: "Discovering events and activities...",
+      detail: "Searching multiple sources",
+    });
+
+    let scoutProgress = 0;
+    const scoutResults = await scoutEvents(
+      city,
+      interestArray,
+      start_date,
+      end_date,
+      (msg) => {
+        logger.log(msg);
+        // Parse scout progress and send updates
+        if (msg.includes("Searching")) {
+          scoutProgress++;
+          const match = msg.match(/"([^"]+)"/);
+          const interest = match ? match[1] : "events";
+          sendEvent("progress", {
+            phase: "scout",
+            message: `Searching for ${interest}...`,
+            detail: msg.replace(/^[^\s]+\s/, ""),
+          });
+        } else if (msg.includes("Found")) {
+          const match = msg.match(/Found (\d+) links/);
+          if (match) {
+            sendEvent("progress", {
+              phase: "scout",
+              message: `Found ${match[1]} potential matches`,
+              detail: msg.replace(/^[^\s]+\s/, ""),
+            });
+          }
+        }
+      }
+    );
+
+    logger.logScoutResults(scoutResults);
+
+    if (scoutResults.allLinks.length === 0) {
+      sendEvent("error", { message: "No events found for your interests" });
+      res.end();
+      return;
+    }
+
+    sendEvent("progress", {
+      phase: "scout_complete",
+      message: `Found ${scoutResults.totalLinksFound} potential events!`,
+      detail: "Now analyzing each one...",
+    });
+
+    // Phase 2: Explorer
+    sendEvent("progress", {
+      phase: "explorer",
+      message: "Analyzing events...",
+      detail: `Processing ${scoutResults.allLinks.length} sources`,
+    });
+
+    let batchCount = 0;
+    const explorerResults = await exploreLinks(
+      scoutResults.allLinks,
+      city,
+      (msg) => {
+        logger.log(msg);
+        // Parse explorer progress
+        if (msg.includes("batch")) {
+          const match = msg.match(/batch (\d+)\/(\d+)/);
+          if (match) {
+            batchCount++;
+            const percent = Math.round(
+              (parseInt(match[1]) / parseInt(match[2])) * 100
+            );
+            sendEvent("progress", {
+              phase: "explorer",
+              message: `Analyzing events... ${percent}%`,
+              detail: `Processing batch ${match[1]} of ${match[2]}`,
+              percent,
+            });
+          }
+        } else if (msg.includes("Found") && msg.includes("valid")) {
+          const match = msg.match(/Found (\d+) valid/);
+          if (match) {
+            sendEvent("progress", {
+              phase: "explorer",
+              message: `Verified ${match[1]} events`,
+              detail: "Extracting details...",
+            });
+          }
+        }
+      }
+    );
+
+    logger.logExplorerResults(explorerResults);
+
+    // Phase 3: Organize
+    sendEvent("progress", {
+      phase: "organize",
+      message: "Organizing your itinerary...",
+      detail: "Creating your personalized schedule",
+    });
+
+    const events = explorerResults.events || [];
+    events.sort(
+      (a, b) =>
+        new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
+    );
+
+    const coverage = analyzeEventCoverage(events, start_date, end_date);
+    logger.logFinalItinerary(events);
+
+    // Send final result
+    const response = {
+      success: true,
+      city,
+      interests: interestArray,
+      date_range: { start: start_date, end: end_date },
+      itinerary: events,
+      itinerary_by_day: coverage,
+      total_items: events.length,
+      events: events.filter((e) => e.type === "event").length,
+      activities: events.filter((e) => e.type === "activity").length,
+      pipeline_stats: {
+        scout: {
+          totalLinksFound: scoutResults.totalLinksFound,
+          searchesPerformed: scoutResults.searchResults?.length || 0,
+        },
+        explorer: {
+          linksAnalyzed: explorerResults.totalAnalyzed,
+          eventsExtracted: explorerResults.totalEvents,
+          linksRejected: explorerResults.rejected?.length || 0,
+        },
+      },
+      generated_at: new Date().toISOString(),
+      request_id: requestId,
+    };
+
+    sendEvent("complete", { message: "Itinerary ready!", data: response });
+    logger.saveAll();
+    res.end();
+  } catch (error) {
+    logger.log(`❌ Error: ${error.message}`);
+    logger.saveAll();
+    sendEvent("error", { message: error.message });
+    res.end();
+  }
 });
 
 // Main itinerary generation endpoint
