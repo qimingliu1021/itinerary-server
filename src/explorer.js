@@ -58,12 +58,15 @@ For each link above, determine if it contains a VALID, SCHEDULED EVENT. Extract 
 2. **SCHEDULED:** Must have a specific start time (not just "Open 10am-6pm")
 3. **NOT GENERAL ADMISSION:** Don't list venues just because they're open
 4. **REAL EVENT:** Must be a meetup, workshop, class, talk, performance, networking event, etc.
+5. **IN-PERSON ONLY:** Must have a physical location in ${city}. NO online, virtual, or remote events.
 
 ## WHAT TO REJECT:
 - "Timed Entry" or "General Admission" slots
 - "Self-guided tours" or "Audio tours"
 - Generic "Visit the museum" without a specific program
 - Venue pages without specific scheduled events
+- **Online/Virtual events** - ANY event hosted via Zoom, Google Meet, Teams, Webex, livestream, or described as "virtual", "online", "remote", or "webinar"
+- Events where the location is "Online", "Virtual", "TBD", or missing a physical address
 
 ## FOR EACH VALID EVENT, EXTRACT:
 - name: Exact event name from the page
@@ -126,6 +129,75 @@ For each link above, determine if it contains a VALID, SCHEDULED EVENT. Extract 
 3. If unsure about event validity, reject it
 4. Times must be in ${city} local timezone
 5. Start with { and end with }`;
+}
+
+/**
+ * Check if an event is online/virtual based on location fields
+ * @param {Object} event - Event object
+ * @returns {boolean} True if event appears to be online
+ */
+function isOnlineEvent(event) {
+  const onlineKeywords = [
+    'online', 'virtual', 'remote', 'zoom', 'webinar', 'livestream',
+    'live stream', 'google meet', 'teams', 'webex', 'discord',
+    'twitch', 'youtube live', 'streaming', 'web-based', 'digital event'
+  ];
+
+  const fieldsToCheck = [
+    event.location?.venue,
+    event.location?.address,
+    event.location?.city,
+    event.name,
+    event.description
+  ].filter(Boolean).map(s => s.toLowerCase());
+
+  for (const field of fieldsToCheck) {
+    for (const keyword of onlineKeywords) {
+      if (field.includes(keyword)) {
+        return true;
+      }
+    }
+  }
+
+  // Check for missing physical address indicators
+  if (event.location) {
+    const venue = (event.location.venue || '').toLowerCase();
+    const address = (event.location.address || '').toLowerCase();
+    
+    // If venue/address is just "online", "virtual", "tbd", or empty
+    if (!address || address === 'tbd' || address === 'n/a') {
+      if (!venue || venue === 'online' || venue === 'virtual' || venue === 'tbd') {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Filter out online events from array
+ * @param {Object[]} events - Array of events
+ * @param {Function} logger - Logging function
+ * @returns {Object[]} Filtered events (in-person only)
+ */
+function filterOnlineEvents(events, logger) {
+  const filtered = [];
+  const removed = [];
+
+  for (const event of events) {
+    if (isOnlineEvent(event)) {
+      removed.push(event.name);
+    } else {
+      filtered.push(event);
+    }
+  }
+
+  if (removed.length > 0) {
+    logger(`🚫 Filtered out ${removed.length} online/virtual events: ${removed.join(', ')}`);
+  }
+
+  return filtered;
 }
 
 /**
@@ -282,16 +354,19 @@ export async function exploreLinks(links, city, logger = console.log) {
     return timeA - timeB;
   });
 
+  // Filter out any online/virtual events that slipped through
+  const inPersonEvents = filterOnlineEvents(uniqueEvents, logger);
+
   logger(`\n✅ Explorer: Completed!`);
   logger(`📊 Total links analyzed: ${totalAnalyzed}`);
-  logger(`🎯 Valid events found: ${uniqueEvents.length}`);
+  logger(`🎯 Valid in-person events found: ${inPersonEvents.length}`);
   logger(`❌ Rejected links: ${allRejected.length}`);
 
   return {
     success: true,
-    events: uniqueEvents,
+    events: inPersonEvents,
     totalAnalyzed,
-    totalEvents: uniqueEvents.length,
+    totalEvents: inPersonEvents.length,
     rejected: allRejected,
   };
 }
