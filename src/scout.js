@@ -175,6 +175,7 @@ export async function searchForInterest(
         tools: [{ googleSearch: {} }],
         temperature: 0.2,
         maxOutputTokens: 4096,
+        thinkingConfig: { thinkingLevel: "low" },
       },
     });
 

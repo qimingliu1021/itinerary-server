@@ -178,6 +178,7 @@ async function analyzeBatch(links, city, logger) {
         tools: [{ googleSearch: {} }], // Enable search to verify/access links
         temperature: 0.1,
         maxOutputTokens: 8192,
+        thinkingConfig: { thinkingLevel: "low" },
       },
     });
 
