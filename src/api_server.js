@@ -423,57 +423,100 @@ app.post("/api/generate-itinerary", async (req, res) => {
 async function processEditRequest(params) {
   const { edit_request, current_activity, city, day_date, interests } = params;
 
-  const systemPrompt = `You are an itinerary editing assistant. Your job is to help users modify their travel plans.
+  const systemPrompt = `You are an intelligent itinerary editing assistant. Your job is to help users modify their travel plans.
 
 You MUST respond with ONLY valid JSON (no markdown, no backticks, no explanation).
 
-Based on the user's request, determine the appropriate operation and provide the result.
+## STEP 1: Classify the user's intent
+First, determine what the user is trying to do:
+- "edit" - User wants to modify, replace, delete, or add activities
+- "issue" - User is reporting a problem (broken link, cancelled event, wrong info, sold out)
+- "question" - User is asking about the activity but not requesting changes
+- "unclear" - Cannot determine what the user wants
 
-Operations:
+## STEP 2: Select the appropriate operation
+
+### For "edit" intent:
 1. "replace" - Replace the current activity with a new one (user wants something different)
 2. "delete" - Remove the activity (user doesn't want it)
 3. "update_time" - Only change the timing
 4. "update_description" - Only change the description
 5. "add" - Add a new activity (user wants to add something nearby/after)
 
-For "replace" or "add" operations, you must provide realistic details:
-- Real place names that exist in ${city}
-- Realistic coordinates (latitude/longitude for ${city})
-- Appropriate timing based on the activity type
-- Detailed description
+### For "issue" intent:
+6. "report_issue" - User reports broken link, event cancelled, wrong info, sold out, etc.
+   - You MUST search for an alternative activity in ${city} when reporting issues
+   - Provide a replacement suggestion unless user explicitly wants deletion
 
-Response format:
+### For "question" intent:
+7. "answer" - Provide helpful information about the activity
+
+### For "unclear" intent:
+8. "clarify" - Ask user for clarification with suggested actions
+
+## RESPONSE FORMATS:
+
+### For "replace", "add", or "report_issue" with alternative:
 {
-  "operation": "replace|delete|update_time|update_description|add",
+  "intent": "edit|issue",
+  "operation": "replace|add|report_issue",
+  "issue_type": "broken_link|event_cancelled|wrong_info|sold_out|unavailable",  // Only for report_issue
   "updated_activity": {
     "name": "Place Name",
-    "location": "Full address",
+    "location": "Full address in ${city}",
     "coordinates": { "lat": number, "lng": number },
     "start_time": "ISO datetime",
     "end_time": "ISO datetime",
     "description": "Description of the place",
-    "type": "activity|restaurant|attraction",
-    "tags": ["tag1", "tag2"]
+    "type": "activity|restaurant|attraction|event",
+    "tags": ["tag1", "tag2"],
+    "source": { "url": "link if available", "platform": "source" }
   },
   "new_activity": { ... },  // Only for "add" operation
   "change_summary": "Brief description of what changed"
 }
 
-For "delete" operation, only include:
+### For "delete":
 {
+  "intent": "edit",
   "operation": "delete",
   "change_summary": "Removed X from itinerary"
 }
 
-For "update_time" operation:
+### For "update_time":
 {
+  "intent": "edit",
   "operation": "update_time",
   "updated_activity": {
     "start_time": "new ISO datetime",
     "end_time": "new ISO datetime"
   },
   "change_summary": "Changed time to X"
-}`;
+}
+
+### For "clarify" (when request is unclear):
+{
+  "intent": "unclear",
+  "operation": "clarify",
+  "message": "I'm not sure what you'd like to change. Could you clarify?",
+  "suggested_actions": ["replace with similar activity", "change the time", "remove it", "find alternative"]
+}
+
+### For "answer" (user asking a question):
+{
+  "intent": "question",
+  "operation": "answer",
+  "message": "Answer to the user's question about the activity",
+  "follow_up": "Would you like me to make any changes to this activity?"
+}
+
+## IMPORTANT RULES:
+- For "replace", "add", or "report_issue": Use REAL places that exist in ${city}
+- For "report_issue": ALWAYS search and suggest an alternative unless user wants deletion
+- Provide realistic coordinates (latitude/longitude for ${city})
+- Use appropriate timing based on the activity type
+- Include detailed descriptions
+- If the event source URL is broken, find a working alternative`;
 
   const userPrompt = `City: ${city}
 Date: ${day_date}
@@ -491,8 +534,9 @@ Provide the appropriate edit response as JSON.`;
       model: CONFIG.geminiModel,
       contents: systemPrompt + "\n\n" + userPrompt,
       config: {
+        tools: [{ googleSearch: {} }],  // Enable search to verify links and find alternatives
         temperature: 0.3,
-        maxOutputTokens: 2048,
+        maxOutputTokens: 4096,
       },
     });
 
